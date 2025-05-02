@@ -3,20 +3,18 @@ package header
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"time"
 
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/wire"
 )
 
 const version = protocol.Version1
-
-// PrefixLen is the number of bytes used for configuration
 const PrefixLen = 1
 
-// Fuzz fuzzes the QUIC header.
-//
-//go:generate go run ./cmd/corpus.go
-func Fuzz(data []byte) int {
+// Fuzz sends malformed QUIC headers to a real-world QUIC server via UDP and performs in-memory parsing checks.
+func Fuzz(data []byte, targetHost string) int {
 	if len(data) < PrefixLen {
 		return 0
 	}
@@ -26,6 +24,7 @@ func Fuzz(data []byte) int {
 	if wire.IsVersionNegotiationPacket(data) {
 		return fuzzVNP(data)
 	}
+
 	connID, err := wire.ParseConnectionID(data, connIDLen)
 	if err != nil {
 		return 0
@@ -33,7 +32,7 @@ func Fuzz(data []byte) int {
 
 	if !wire.IsLongHeaderPacket(data[0]) {
 		wire.ParseShortHeader(data, connIDLen)
-		return 1
+		return sendToServer(data, targetHost)
 	}
 
 	is0RTTPacket := wire.Is0RTTPacket(data)
@@ -49,36 +48,63 @@ func Fuzz(data []byte) int {
 	}
 
 	var extHdr *wire.ExtendedHeader
-	// Parse the extended header, if this is not a Retry packet.
 	if hdr.Type == protocol.PacketTypeRetry {
 		extHdr = &wire.ExtendedHeader{Header: *hdr}
 	} else {
-		var err error
 		extHdr, err = hdr.ParseExtended(data)
 		if err != nil {
 			return 0
 		}
 	}
-	// We always use a 2-byte encoding for the Length field in Long Header packets.
-	// Serializing the header will fail when using a higher value.
+
 	if hdr.Length > 16383 {
-		return 1
+		return sendToServer(data, targetHost)
 	}
+
 	b, err := extHdr.Append(nil, version)
 	if err != nil {
-		// We are able to parse packets with connection IDs longer than 20 bytes,
-		// but in QUIC version 1, we don't write headers with longer connection IDs.
-		if hdr.DestConnectionID.Len() <= protocol.MaxConnIDLen &&
-			hdr.SrcConnectionID.Len() <= protocol.MaxConnIDLen {
+		if hdr.DestConnectionID.Len() <= protocol.MaxConnIDLen && hdr.SrcConnectionID.Len() <= protocol.MaxConnIDLen {
 			panic(err)
 		}
 		return 0
 	}
-	// GetLength is not implemented for Retry packets
+
 	if hdr.Type != protocol.PacketTypeRetry {
-		if expLen := extHdr.GetLength(version); expLen != protocol.ByteCount(len(b)) {
+		expLen := extHdr.GetLength(version)
+		if expLen != protocol.ByteCount(len(b)) {
 			panic(fmt.Sprintf("inconsistent header length: %#v. Expected %d, got %d", extHdr, expLen, len(b)))
 		}
+	}
+
+	return sendToServer(data, targetHost)
+}
+
+func sendToServer(data []byte, targetHost string) int {
+	target := net.JoinHostPort(targetHost, "443")
+	udpAddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		fmt.Println("Failed to resolve address:", err)
+		return 0
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		fmt.Println("Failed to dial UDP:", err)
+		return 0
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(data)
+	if err != nil {
+		fmt.Println("Failed to write packet:", err)
+		return 0
+	}
+
+	buf := make([]byte, 1500)
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	n, _, err := conn.ReadFrom(buf)
+	if err == nil && n > 0 {
+		fmt.Printf("Received %d bytes in response\n", n)
 	}
 	return 1
 }
@@ -99,5 +125,5 @@ func fuzzVNP(data []byte) int {
 		panic("no versions")
 	}
 	wire.ComposeVersionNegotiation(src, dest, versions)
-	return 1
+	return sendToServer(data, "127.0.0.1") // Adjust this as needed
 }
